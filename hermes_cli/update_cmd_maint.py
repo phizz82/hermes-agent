@@ -235,6 +235,39 @@ def _format_time_ago(iso_ts: str) -> str:
         return "recently"
 
 
+def _reload_dashboard_scan_modules() -> None:
+    """Reload the dashboard-scan modules so they bind against fresh code post-pull.
+
+    Updaters on a version before the post-swap hand-off (``hermes_cli.update_handoff``,
+    i.e. <= v2026.9.14) finish the update in the *same* pre-pull Python process instead of
+    re-exec'ing into one born on the pulled tree. ``hermes_cli.main`` is imported once at CLI
+    startup and eagerly does ``from hermes_cli.main_dashboard import _find_stale_dashboard_pids``
+    — a top-level binding frozen to the OLD function object. ``dashboard_procs.py`` then does a
+    *lazy*, function-scoped ``from hermes_cli import main_dashboard as _dash``; lazy only means
+    "not at import time", not "re-read from disk" — ``sys.modules`` already has the stale entry
+    from ``main``'s eager import, so ``_dash`` resolves to the same frozen OLD module. When the
+    pulled code adds a parameter to a dashboard-scan function (e.g. ``scope_home``, #113978), the
+    fresh caller in the freshly-imported ``dashboard_procs`` passes it straight into the stale
+    ``main_dashboard`` function and gets ``TypeError: ... unexpected keyword argument``.
+
+    ``dashboard_procs`` itself isn't eagerly imported by ``main.py``, so its first import in the
+    process is naturally fresh post-pull — only ``main_dashboard`` (and anything else
+    ``main.py`` pulls in eagerly) needs the explicit reload. Mirrors the reload this class of bug
+    previously got via ``_reload_process_scan_modules`` (removed as ostensibly-dead once the
+    hand-off shipped — it forgot it's still the only guard for the one upgrade *onto* the
+    hand-off from a version that predates it).
+    """
+    import importlib
+    for mod_name in ("hermes_cli.main_dashboard", "hermes_cli.dashboard_procs", "hermes_cli._subprocess_compat"):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        try:
+            importlib.reload(mod)
+        except Exception as exc:
+            logger.warning("Could not reload %s for post-update dashboard cleanup: %s", mod_name, exc)
+
+
 def _finish_dashboard_update_cleanup(
     node_failures: list[str], already_restarted_units: "set[str] | None" = None
 ) -> None:
@@ -251,6 +284,8 @@ def _finish_dashboard_update_cleanup(
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
         return
+
+    _reload_dashboard_scan_modules()
 
     try:
         from hermes_constants import get_hermes_home
